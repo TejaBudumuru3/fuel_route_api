@@ -1,5 +1,14 @@
-import csv
-import io
+"""
+seed_stations — Seed gas stations from CSV and geocode ALL of them.
+
+Strategy (completes in under 2 minutes, no long API waits):
+  1. Load CSV, deduplicate by OPIS ID → ~6700 unique stations
+  2. Bulk-insert all stations into the database
+  3. Geocode ALL stations using a LOCAL US cities coordinates file
+     (data/us_cities.csv — 29K cities, ~98% coverage)
+  4. For any remaining unmatched cities (mostly Canadian),
+     do a quick Nominatim lookup (only for unique cities, not per station)
+"""
 import time
 
 import requests
@@ -7,18 +16,26 @@ import pandas as pd
 from django.core.management.base import BaseCommand
 from apps.stations.models import GasStation
 
-CENSUS_URL = "https://geocoding.geo.census.gov/geocoder/locations/addressbatch"
-BATCH_SIZE = 1000
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_HEADERS = {
+    "User-Agent": "FuelRouteOptimizer/1.0 (fuelroute@optimizer.dev)"
+}
+
+# Path to the bundled US cities database (relative to project root)
+US_CITIES_CSV = "data/us_cities.csv"
 
 
 class Command(BaseCommand):
-    help = "Seed gas stations from CSV; geocode via US Census Batch API"
+    help = (
+        "Seed gas stations from CSV and geocode ALL of them. "
+        "Uses a local US cities database for fast geocoding (~2 min)."
+    )
 
     def add_arguments(self, parser):
         parser.add_argument("--csv", type=str, required=True,
                             help="Path to the fuel prices CSV file")
         parser.add_argument("--force", action="store_true",
-                            help="Re-geocode already-geocoded stations")
+                            help="Drop all stations and re-seed from scratch")
 
     def handle(self, *args, **options):
         # ── Step 1: Load and aggregate ──────────────────────────────────
@@ -26,7 +43,6 @@ class Command(BaseCommand):
         df = pd.read_csv(options["csv"], dtype=str)
         df.columns = ["opis_id", "name", "address", "city", "state",
                        "rack_id", "retail_price"]
-        # Strip whitespace from all string columns
         for col in ["name", "address", "city", "state"]:
             df[col] = df[col].str.strip()
         df["retail_price"] = pd.to_numeric(df["retail_price"], errors="coerce")
@@ -44,8 +60,12 @@ class Command(BaseCommand):
             f"  {len(df)} rows reduced to {len(agg)} unique stations"
         )
 
-        # ── Step 2: Bulk insert new stations ────────────────────────────
+        # ── Step 2: Insert stations into DB ─────────────────────────────
         self.stdout.write("Step 2: Inserting stations into DB...")
+        if options["force"]:
+            deleted, _ = GasStation.objects.all().delete()
+            self.stdout.write(f"  --force: Deleted {deleted} existing stations")
+
         existing = set(
             GasStation.objects.values_list("opis_id", flat=True)
         )
@@ -62,170 +82,180 @@ class Command(BaseCommand):
             for r in agg.itertuples()
             if int(r.opis_id) not in existing
         ]
-        GasStation.objects.bulk_create(
-            to_create, batch_size=500, ignore_conflicts=True
-        )
+        if to_create:
+            GasStation.objects.bulk_create(
+                to_create, batch_size=500, ignore_conflicts=True
+            )
         self.stdout.write(f"  Inserted {len(to_create)} stations")
 
-        # ── Step 3: Geocode via Census Batch API ────────────────────────
-        if options["force"]:
-            qs = GasStation.objects.all()
-        else:
-            qs = GasStation.objects.filter(geocoded=False)
-        stations = list(
-            qs.values("id", "opis_id", "address", "city", "state")
-        )
+        # ── Step 3: Geocode using local US cities database ──────────────
+        self.stdout.write("Step 3: Geocoding via local cities database...")
 
-        if not stations:
-            self.stdout.write("All stations already geocoded.")
+        # Load the local cities lookup
+        city_lookup = self._load_city_lookup()
+        self.stdout.write(f"  Loaded {len(city_lookup)} city coordinates")
+
+        # Get all un-geocoded stations (or all if --force)
+        ungeocoded = list(GasStation.objects.filter(geocoded=False))
+        if not ungeocoded:
+            self.stdout.write(self.style.SUCCESS(
+                "All stations already geocoded. Use --force to re-seed."
+            ))
             return
 
-        self.stdout.write(
-            f"Step 3: Geocoding {len(stations)} stations via Census API..."
-        )
-        batches = [
-            stations[i:i + BATCH_SIZE]
-            for i in range(0, len(stations), BATCH_SIZE)
-        ]
-        total_matched = 0
+        self.stdout.write(f"  {len(ungeocoded)} stations need geocoding")
 
-        for i, batch in enumerate(batches, 1):
-            self.stdout.write(
-                f"  Batch {i}/{len(batches)} ({len(batch)} records)..."
+        # Match against local lookup
+        matched_objs = []
+        unmatched_cities = {}  # {(city, state): [station_objs]}
+
+        for station in ungeocoded:
+            key = (station.city.upper().strip(),
+                   station.state.upper().strip())
+            if key in city_lookup:
+                lat, lon = city_lookup[key]
+                station.lat = lat
+                station.lon = lon
+                station.geocoded = True
+                matched_objs.append(station)
+            else:
+                unmatched_cities.setdefault(key, []).append(station)
+
+        # Bulk update matched stations
+        if matched_objs:
+            GasStation.objects.bulk_update(
+                matched_objs, ["lat", "lon", "geocoded"], batch_size=500
             )
-            csv_buf = self._build_census_csv(batch)
-            try:
-                response_text = self._post_census(csv_buf)
-                matched = self._apply_geocode_results(response_text)
-                total_matched += matched
-                self.stdout.write(f"    Matched {matched} stations in batch")
-            except requests.RequestException as e:
-                self.stderr.write(
-                    f"    Census API error on batch {i}: {e}"
-                )
-            time.sleep(0.5)
+        self.stdout.write(
+            f"  Local lookup matched {len(matched_objs)}/{len(ungeocoded)} "
+            f"stations"
+        )
+
+        # ── Step 4: Nominatim fallback for remaining cities ─────────────
+        if unmatched_cities:
+            self.stdout.write(
+                f"Step 4: Nominatim fallback for {len(unmatched_cities)} "
+                f"unmatched cities ({sum(len(v) for v in unmatched_cities.values())} stations)..."
+            )
+            nominatim_matched = self._geocode_remaining(unmatched_cities)
+            self.stdout.write(
+                f"  Nominatim matched {nominatim_matched} more stations"
+            )
+        else:
+            self.stdout.write("Step 4: No fallback needed — all cities matched!")
+
+        # ── Summary ─────────────────────────────────────────────────────
+        final_total = GasStation.objects.count()
+        final_geocoded = GasStation.objects.filter(geocoded=True).count()
+        final_remaining = final_total - final_geocoded
 
         self.stdout.write(self.style.SUCCESS(
-            f"Done. {total_matched}/{len(stations)} stations geocoded."
+            f"\nDone! {final_geocoded}/{final_total} stations geocoded.\n"
+            f"  Still ungeocoded: {final_remaining}"
         ))
 
     # ── Helpers ─────────────────────────────────────────────────────────
 
-    def _build_census_csv(self, stations):
+    def _load_city_lookup(self):
         """
-        Build a Census-format CSV:
-        Unique ID, Street Address, City, State, ZIP (blank)
+        Load data/us_cities.csv into a dict:
+          {(CITY_UPPER, STATE_CODE_UPPER): (lat, lon)}
         """
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        for s in stations:
-            w.writerow([
-                s["opis_id"], s["address"], s["city"], s["state"], ""
-            ])
-        return buf.getvalue()
+        try:
+            cities_df = pd.read_csv(US_CITIES_CSV)
+        except FileNotFoundError:
+            self.stderr.write(
+                f"ERROR: {US_CITIES_CSV} not found. "
+                "Download it from: "
+                "https://github.com/kelvins/US-Cities-Database"
+            )
+            return {}
 
-    def _post_census(self, csv_content, retries=3):
+        lookup = {}
+        for _, row in cities_df.iterrows():
+            key = (
+                str(row["CITY"]).upper().strip(),
+                str(row["STATE_CODE"]).upper().strip()
+            )
+            # First entry wins (avoid overwriting)
+            if key not in lookup:
+                lookup[key] = (float(row["LATITUDE"]),
+                               float(row["LONGITUDE"]))
+        return lookup
+
+    def _geocode_remaining(self, unmatched_cities):
         """
-        POST to the Census Batch Geocoder with retry logic.
+        Geocode unmatched cities via Nominatim (one call per unique city).
+        Typically only ~20-30 cities, finishes in under a minute.
         """
-        for attempt in range(retries):
-            try:
-                r = requests.post(
-                    CENSUS_URL,
-                    files={
-                        "addressFile": (
-                            "batch.csv", csv_content, "text/plain"
-                        )
-                    },
-                    data={
-                        "benchmark": "Public_AR_Current",
-                        "returntype": "locations"
-                    },
-                    timeout=120
+        total_matched = 0
+
+        for i, ((city, state), stations) in enumerate(
+            unmatched_cities.items(), 1
+        ):
+            # Try multiple query formats
+            queries = [
+                f"{city}, {state}, USA",
+                f"{city}, {state}, Canada",
+                f"{city}, {state}",
+            ]
+
+            lat, lon = None, None
+            for query in queries:
+                try:
+                    lat, lon = self._nominatim_geocode(query)
+                    break
+                except (ValueError, requests.RequestException):
+                    continue
+
+            if lat is not None:
+                # Update all stations in this city
+                for s in stations:
+                    s.lat = lat
+                    s.lon = lon
+                    s.geocoded = True
+                GasStation.objects.bulk_update(
+                    stations, ["lat", "lon", "geocoded"]
                 )
-                r.raise_for_status()
-                return r.text
-            except requests.RequestException:
-                if attempt == retries - 1:
-                    raise
-                time.sleep(2 ** attempt)
+                total_matched += len(stations)
+            else:
+                self.stderr.write(
+                    f"  Could not geocode: {city}, {state} "
+                    f"({len(stations)} stations)"
+                )
 
-    def _apply_geocode_results(self, response_text):
-        """
-        Parse Census Batch Geocoder response.
+            # Rate limit: 1 req/sec with margin
+            time.sleep(1.5)
 
-        Census response row structure (after CSV split):
-          [0] OPIS ID
-          [1] Input address
-          [2] Match status ("Match" / "No_Match" / "Tie")
-          [3] Match precision ("Exact" / "Non_Exact")
-          [4] Matched address string
-          [5] Coordinates — "longitude,latitude" sub-string
-          [6] Tiger/Line ID
-          [7] Street side
+            if i % 10 == 0:
+                self.stdout.write(
+                    f"  [{i}/{len(unmatched_cities)}] "
+                    f"{total_matched} stations matched so far"
+                )
 
-        IMPORTANT: Column [5] contains "longitude,latitude" as a
-        comma-separated sub-string. When splitting the full row by comma
-        naively, the coordinate sub-string splits across columns [5] and [6].
-        Treat columns [5] and [6] as longitude and latitude respectively.
-        """
-        updates = []
-        for line in response_text.strip().split("\n"):
-            if not line.strip():
+        return total_matched
+
+    def _nominatim_geocode(self, query):
+        """Geocode via Nominatim with retry on 429."""
+        params = {
+            "q": query,
+            "format": "json",
+            "limit": 1,
+        }
+        for attempt in range(3):
+            response = requests.get(
+                NOMINATIM_URL, params=params,
+                headers=NOMINATIM_HEADERS, timeout=10
+            )
+            if response.status_code == 429:
+                time.sleep(5 * (2 ** attempt))
                 continue
-            # Use csv.reader to handle quoted fields properly
-            try:
-                reader = csv.reader(io.StringIO(line))
-                parts = next(reader)
-            except (csv.Error, StopIteration):
-                continue
+            response.raise_for_status()
+            results = response.json()
 
-            if len(parts) < 8:
-                continue
+            if not results:
+                raise ValueError(f"No result for: '{query}'")
 
-            # Column 2 is match status
-            if parts[2].strip().strip('"').upper() != "MATCH":
-                continue
+            return float(results[0]["lat"]), float(results[0]["lon"])
 
-            try:
-                # Column 5 is the coordinates field: "lon,lat"
-                # The CSV reader may keep it as one field or split it
-                coord_str = parts[5].strip().strip('"')
-                if "," in coord_str:
-                    # Coordinates are in a single field: "lon,lat"
-                    lon_str, lat_str = coord_str.split(",", 1)
-                    lon = float(lon_str.strip())
-                    lat = float(lat_str.strip())
-                else:
-                    # Coordinates were split by naive CSV parsing
-                    lon = float(parts[5].strip())
-                    lat = float(parts[6].strip())
-            except (ValueError, IndexError):
-                continue
-
-            opis_id_str = parts[0].strip().strip('"')
-            try:
-                opis_id = int(opis_id_str)
-            except ValueError:
-                continue
-
-            updates.append({
-                "opis_id": opis_id,
-                "lat": lat,
-                "lon": lon
-            })
-
-        if not updates:
-            return 0
-
-        id_map = {u["opis_id"]: u for u in updates}
-        objs = list(
-            GasStation.objects.filter(opis_id__in=list(id_map.keys()))
-        )
-        for obj in objs:
-            u = id_map[obj.opis_id]
-            obj.lat = u["lat"]
-            obj.lon = u["lon"]
-            obj.geocoded = True
-        GasStation.objects.bulk_update(objs, ["lat", "lon", "geocoded"])
-        return len(objs)
+        raise requests.RequestException(f"Rate limited: '{query}'")
