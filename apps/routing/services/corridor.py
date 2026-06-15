@@ -5,7 +5,7 @@ from apps.stations.models import GasStation
 
 EARTH_RADIUS_MILES = 3958.8
 MILES_PER_DEG_LAT = 69.0
-SAMPLE_INTERVAL_MI = 15.0    # checkpoint every ~15 miles along route
+SAMPLE_INTERVAL_MI = 1.0    # checkpoint every ~15 miles along route
 CORRIDOR_RADIUS_MI = 10.0    # station must be within 10 miles of route
 
 

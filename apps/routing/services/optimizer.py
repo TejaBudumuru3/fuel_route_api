@@ -117,7 +117,12 @@ def optimize_fuel_stops(
             to_buy = min(to_buy, TANK_CAPACITY_GALLONS - tank)
         else:
             # No cheaper station ahead — fill to max
-            to_buy = TANK_CAPACITY_GALLONS - tank
+            miles_to_destination = total_route_miles - current_pos
+            gallons_to_destination = miles_to_destination * FUEL_CONSUMPTION_GPM
+            
+            # Buy enough to reach the end, but don't overfill the physical tank
+            to_buy = max(0.0, gallons_to_destination - tank)
+            to_buy = min(to_buy, TANK_CAPACITY_GALLONS - tank)
 
         # Skip trivially small purchases (avoid micro-stops)
         to_buy = max(0.0, round(to_buy, 4))
